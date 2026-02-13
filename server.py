@@ -31,7 +31,7 @@ import time
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from ocr_engine.preprocessor import ImagePreprocessor
@@ -173,6 +173,19 @@ WEB_PAGE = """
         }
         .spinner.active { display: block; }
         .error { color: #ff6b6b; }
+        .mode-btn {
+            flex: 1;
+            padding: 10px 16px;
+            background: #1a1a1a;
+            color: #888;
+            border: 1px solid #333;
+            border-radius: 8px;
+            font-size: 0.95rem;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .mode-btn:hover { border-color: #4a9eff; color: #ccc; }
+        .mode-btn.active { background: #1a2a3a; border-color: #4a9eff; color: #4a9eff; }
     </style>
 </head>
 <body>
@@ -180,6 +193,19 @@ WEB_PAGE = """
     <p class="subtitle">Upload an image to extract text using AI</p>
 
     <div class="container">
+        <!-- Mode Selector -->
+        <div style="display:flex; gap:10px; margin-bottom:20px;">
+            <button class="mode-btn active" id="modePrinted" onclick="setMode('printed')">
+                Printed Text
+            </button>
+            <button class="mode-btn" id="modeHandwritten" onclick="setMode('handwritten')">
+                Handwritten
+            </button>
+        </div>
+        <p id="modeHint" style="color:#666; font-size:0.82rem; margin-bottom:16px;">
+            Best for screenshots, documents, books, and digital text
+        </p>
+
         <!-- Upload Zone -->
         <div class="upload-zone" id="dropZone">
             <div class="upload-icon">&#128196;</div>
@@ -218,6 +244,16 @@ WEB_PAGE = """
         const resultMeta = document.getElementById('resultMeta');
         const extractBtn = document.getElementById('extractBtn');
         let selectedFile = null;
+        let currentMode = 'printed';
+
+        function setMode(mode) {
+            currentMode = mode;
+            document.getElementById('modePrinted').classList.toggle('active', mode === 'printed');
+            document.getElementById('modeHandwritten').classList.toggle('active', mode === 'handwritten');
+            document.getElementById('modeHint').textContent = mode === 'printed'
+                ? 'Best for screenshots, documents, books, and digital text'
+                : 'Best for handwritten notes, pen-on-paper photos';
+        }
 
         // Click to upload
         dropZone.addEventListener('click', () => fileInput.click());
@@ -265,6 +301,7 @@ WEB_PAGE = """
 
             const formData = new FormData();
             formData.append('file', selectedFile);
+            formData.append('mode', currentMode);
 
             try {
                 const startTime = Date.now();
@@ -308,13 +345,19 @@ async def web_interface():
 
 
 @app.post("/extract-text")
-async def extract_text(file: UploadFile = File(...)):
+async def extract_text(file: UploadFile = File(...), mode: str = Form("printed")):
     """
     Accept an image upload and return extracted text.
 
-    Request:  POST /extract-text  with multipart form file
-    Response: {"extracted_text": "...", "engine": "...", "filename": "..."}
+    Args:
+        file: Image upload
+        mode: "printed" or "handwritten"
     """
+    import cv2
+    import numpy as np
+    from PIL import Image as PILImage
+    import pytesseract as pyt
+
     # Validate file type
     ext = Path(file.filename).suffix.lower()
     if ext not in ALLOWED_EXTENSIONS:
@@ -325,7 +368,7 @@ async def extract_text(file: UploadFile = File(...)):
 
     # Save upload to temp file
     start = time.time()
-    log.info(f"Received image: {file.filename} ({file.content_type})")
+    log.info(f"Received image: {file.filename} mode={mode}")
 
     with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
         content = await file.read()
@@ -333,22 +376,57 @@ async def extract_text(file: UploadFile = File(...)):
         tmp_path = tmp.name
 
     try:
-        # Preprocess
-        log.info("Preprocessing image...")
         if crnn_predictor:
-            # Custom model mode: use CRNN full-page pipeline
             text = _predict_crnn(tmp_path)
             engine = "crnn (custom trained)"
-        elif recognizer.engine == "easyocr":
-            processed = preprocessor.preprocess_for_easyocr(tmp_path)
-            text = recognizer.recognize(processed)
-            engine = "easyocr"
+
+        elif mode == "handwritten":
+            # Handwriting pipeline:
+            # 1. CLAHE to fix uneven lighting / shadows on paper
+            # 2. Bilateral filter to smooth paper texture, keep ink edges
+            # 3. EasyOCR (deep learning) which handles handwriting far
+            #    better than Tesseract's classical approach
+            log.info("Using handwriting mode (EasyOCR)...")
+            import easyocr
+
+            img = cv2.imread(tmp_path)
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(gray)
+
+            filtered = cv2.bilateralFilter(enhanced, 9, 75, 75)
+
+            if not hasattr(extract_text, "_easyocr_reader"):
+                extract_text._easyocr_reader = easyocr.Reader(["en"], gpu=False)
+            reader = extract_text._easyocr_reader
+
+            results = reader.readtext(filtered)
+            # Sort by vertical position (top to bottom), then left to right
+            results.sort(key=lambda r: (min(p[1] for p in r[0]), min(p[0] for p in r[0])))
+
+            # Group into lines by y-coordinate proximity
+            lines = []
+            current_line = []
+            last_y = -999
+            for bbox, txt, conf in results:
+                if conf < 0.15:
+                    continue
+                y = min(p[1] for p in bbox)
+                if current_line and abs(y - last_y) > 25:
+                    lines.append(" ".join(current_line))
+                    current_line = []
+                current_line.append(txt)
+                last_y = y
+            if current_line:
+                lines.append(" ".join(current_line))
+
+            text = "\n".join(lines)
+            engine = "easyocr (handwriting mode)"
+
         else:
-            # Feed the raw image directly to Tesseract — it has excellent
-            # internal preprocessing (Otsu binarization, line detection, etc.)
-            # that outperforms our manual pipeline on most image types.
-            from PIL import Image as PILImage
-            import pytesseract as pyt
+            # Printed text: raw image to Tesseract
+            log.info("Using printed text mode...")
             pil_img = PILImage.open(tmp_path)
             text = pyt.image_to_string(pil_img, lang="eng", config="--oem 3 --psm 3").strip()
             engine = "tesseract"
