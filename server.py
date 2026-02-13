@@ -344,14 +344,13 @@ async def extract_text(file: UploadFile = File(...)):
             text = recognizer.recognize(processed)
             engine = "easyocr"
         else:
-            # Use light preprocessing for Tesseract: grayscale + denoise only.
-            # The full pipeline (threshold + deskew) destroys detail in
-            # screenshots, photos, and colored images. Tesseract works best
-            # with clean grayscale input — it handles binarization internally.
-            image = preprocessor.load_image(tmp_path)
-            gray = preprocessor.to_grayscale(image)
-            denoised = preprocessor.remove_noise(gray)
-            text = recognizer.recognize(denoised)
+            # Feed the raw image directly to Tesseract — it has excellent
+            # internal preprocessing (Otsu binarization, line detection, etc.)
+            # that outperforms our manual pipeline on most image types.
+            from PIL import Image as PILImage
+            import pytesseract as pyt
+            pil_img = PILImage.open(tmp_path)
+            text = pyt.image_to_string(pil_img, lang="eng", config="--oem 3 --psm 3").strip()
             engine = "tesseract"
 
         elapsed = time.time() - start
